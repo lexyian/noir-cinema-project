@@ -3,16 +3,21 @@ const fs = require('fs/promises');
 const path = require('path');
 const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
+const cloudinary = require('cloudinary').v2;
+
 require('dotenv').config();
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+
 const MONGODB_URI = process.env.MONGODB_URI;
 const DB_NAME = process.env.MONGODB_DB_NAME || 'noir_cinema';
 
 const FRONTEND_DIR = path.join(__dirname, 'noir-cinema-code');
 const POSTER_DIR = path.join(__dirname, 'uploads', 'posters');
+
 const MAX_POSTER_BYTES = 2 * 1024 * 1024;
+
 const POSTER_TYPES = {
     'image/jpeg': 'jpg',
     'image/png': 'png',
@@ -20,12 +25,69 @@ const POSTER_TYPES = {
     'image/gif': 'gif'
 };
 
+// Cloudinary configuration
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+    secure: true
+});
+
 app.use(express.json({ limit: '4mb' }));
 
 let mongoClient;
 let database;
+let mongoConnectionPromise;
 
-// Check MongoDB connection
+// Connect to MongoDB
+async function connectDatabase() {
+    if (database) return database;
+
+    if (!MONGODB_URI) {
+        throw new Error('Missing MONGODB_URI environment variable.');
+    }
+
+    if (!mongoConnectionPromise) {
+        mongoConnectionPromise = (async () => {
+            mongoClient = new MongoClient(MONGODB_URI);
+
+            await mongoClient.connect();
+
+            database = mongoClient.db(DB_NAME);
+
+            await database.command({ ping: 1 });
+
+            console.log(`Connected to MongoDB database: ${DB_NAME}`);
+
+            return database;
+        })().catch(error => {
+            mongoClient = null;
+            database = null;
+            mongoConnectionPromise = null;
+
+            throw error;
+        });
+    }
+
+    return mongoConnectionPromise;
+}
+
+// Connect to MongoDB before processing API requests
+app.use('/api', async (req, res, next) => {
+    try {
+        await connectDatabase();
+        next();
+    } catch (error) {
+        console.error('MongoDB connection failed:', error.message);
+
+        res.status(503).json({
+            message: 'Database connection failed.',
+            error: error.message
+        });
+    }
+});
+
+// MongoDB health check
 app.get('/api/health', async (req, res) => {
     if (!database) {
         return res.status(503).json({
@@ -70,11 +132,9 @@ app.get('/api/movies', async (req, res) => {
 // GET one movie
 app.get('/api/movies/:id', async (req, res) => {
     try {
-        const id = req.params.id;
-
-        const movie = await database.collection('movies').findOne({
-            _id: ObjectId.isValid(id) ? new ObjectId(id) : id
-        });
+        const movie = await database.collection('movies').findOne(
+            movieFilter(req.params.id)
+        );
 
         if (!movie) {
             return res.status(404).json({
@@ -98,7 +158,10 @@ app.post('/api/movies', async (req, res) => {
 
         let pendingPoster = null;
 
-        if (typeof movie.poster === 'string' && movie.poster.startsWith('data:')) {
+        if (
+            typeof movie.poster === 'string' &&
+            movie.poster.startsWith('data:')
+        ) {
             pendingPoster = movie.poster;
             movie.poster = '';
         }
@@ -127,7 +190,9 @@ app.post('/api/movies', async (req, res) => {
         const status = error.status || 500;
 
         res.status(status).json({
-            message: status === 500 ? 'Failed to add movie.' : error.message,
+            message: status === 500
+                ? 'Failed to add movie.'
+                : error.message,
             error: status === 500 ? error.message : undefined
         });
     }
@@ -136,8 +201,7 @@ app.post('/api/movies', async (req, res) => {
 // UPDATE a movie
 app.put('/api/movies/:id', async (req, res) => {
     try {
-        const id = req.params.id;
-        const movieId = ObjectId.isValid(id) ? new ObjectId(id) : id;
+        const movieId = getMovieId(req.params.id);
         const updates = { ...req.body };
 
         delete updates._id;
@@ -149,11 +213,20 @@ app.put('/api/movies/:id', async (req, res) => {
             delete updates.poster;
 
             if (poster == null || poster === '') {
-                // An edit that does not include a new image must keep the saved poster.
-            } else if (typeof poster === 'string' && poster.startsWith('data:')) {
+                // Keep the existing poster.
+            } else if (
+                typeof poster === 'string' &&
+                poster.startsWith('data:image/')
+            ) {
                 pendingPoster = poster;
-            } else if (typeof poster === 'string' && poster.startsWith('/uploads/posters/')) {
-                updates.poster = poster;
+            } else if (
+                typeof poster === 'string' &&
+                (
+                    poster.startsWith('/uploads/posters/') ||
+                    poster.startsWith('https://res.cloudinary.com/')
+                )
+            ) {
+                // Keep existing poster URL.
             } else {
                 return res.status(400).json({
                     message: 'Upload the poster as an image file.'
@@ -202,7 +275,9 @@ app.put('/api/movies/:id', async (req, res) => {
         const status = error.status || 500;
 
         res.status(status).json({
-            message: status === 500 ? 'Failed to update movie.' : error.message,
+            message: status === 500
+                ? 'Failed to update movie.'
+                : error.message,
             error: status === 500 ? error.message : undefined
         });
     }
@@ -211,8 +286,16 @@ app.put('/api/movies/:id', async (req, res) => {
 // DELETE a movie
 app.delete('/api/movies/:id', async (req, res) => {
     try {
-        const id = req.params.id;
-        const movieId = ObjectId.isValid(id) ? new ObjectId(id) : id;
+        const movieId = getMovieId(req.params.id);
+
+        const movie = await database.collection('movies')
+            .findOne({ _id: movieId });
+
+        if (!movie) {
+            return res.status(404).json({
+                message: 'Movie not found.'
+            });
+        }
 
         const result = await database.collection('movies')
             .deleteOne({ _id: movieId });
@@ -223,9 +306,39 @@ app.delete('/api/movies/:id', async (req, res) => {
             });
         }
 
-        await Promise.all(['jpg', 'jpeg', 'png', 'webp', 'gif'].map(ext => (
-            fs.rm(path.join(POSTER_DIR, `${String(movieId)}.${ext}`), { force: true })
-        )));
+        // Delete poster from Cloudinary
+        if (movie.posterPublicId) {
+            try {
+                await cloudinary.uploader.destroy(
+                    movie.posterPublicId,
+                    {
+                        resource_type: 'image',
+                        invalidate: true
+                    }
+                );
+            } catch (error) {
+                console.error(
+                    'Could not delete Cloudinary poster:',
+                    error.message
+                );
+            }
+        }
+
+        // Clean up legacy local poster files.
+        // No directory creation is performed on Vercel.
+        if (process.env.VERCEL !== '1') {
+            await Promise.all(
+                ['jpg', 'jpeg', 'png', 'webp', 'gif'].map(ext =>
+                    fs.rm(
+                        path.join(
+                            POSTER_DIR,
+                            `${String(movieId)}.${ext}`
+                        ),
+                        { force: true }
+                    )
+                )
+            );
+        }
 
         res.json({
             message: 'Movie deleted successfully.'
@@ -238,10 +351,11 @@ app.delete('/api/movies/:id', async (req, res) => {
     }
 });
 
-// Save a poster onto an existing movie. The same movie id is updated in place.
+// SAVE a poster onto an existing movie
 app.post('/api/movies/:id/poster', async (req, res) => {
     try {
-        const movie = await database.collection('movies').findOne(movieFilter(req.params.id));
+        const movie = await database.collection('movies')
+            .findOne(movieFilter(req.params.id));
 
         if (!movie) {
             return res.status(404).json({
@@ -249,7 +363,10 @@ app.post('/api/movies/:id/poster', async (req, res) => {
             });
         }
 
-        const updatedMovie = await storePoster(movie, req.body && req.body.image);
+        const updatedMovie = await storePoster(
+            movie,
+            req.body && req.body.image
+        );
 
         res.json({
             message: 'Poster saved.',
@@ -259,23 +376,36 @@ app.post('/api/movies/:id/poster', async (req, res) => {
         const status = error.status || 500;
 
         res.status(status).json({
-            message: status === 500 ? 'Failed to save poster.' : error.message,
+            message: status === 500
+                ? 'Failed to save poster.'
+                : error.message,
             error: status === 500 ? error.message : undefined
         });
     }
 });
 
-app.use('/uploads/posters', express.static(POSTER_DIR, {
-    fallthrough: false,
-    index: false,
-    maxAge: '1h'
-}));
+// Legacy locally stored posters.
+// This directory is not created on Vercel.
+if (process.env.VERCEL !== '1') {
+    app.use('/uploads/posters', express.static(POSTER_DIR, {
+        fallthrough: false,
+        index: false,
+        maxAge: '1h'
+    }));
+}
 
-// Serve the frontend
+// Serve favicon files
+app.use(express.static(path.join(FRONTEND_DIR, 'public')));
+
+// Serve frontend
 app.use(express.static(FRONTEND_DIR));
 
+// Handle oversized JSON uploads
 app.use((error, req, res, next) => {
-    if (error && (error.type === 'entity.too.large' || error.status === 413)) {
+    if (
+        error &&
+        (error.type === 'entity.too.large' || error.status === 413)
+    ) {
         return res.status(413).json({
             message: 'Upload is too large. Choose a smaller poster.'
         });
@@ -284,19 +414,33 @@ app.use((error, req, res, next) => {
     return next(error);
 });
 
-function movieFilter(id) {
-    return { _id: ObjectId.isValid(id) ? new ObjectId(id) : id };
+// Get MongoDB movie ID
+function getMovieId(id) {
+    return ObjectId.isValid(id) ? new ObjectId(id) : id;
 }
 
+// Create MongoDB movie filter
+function movieFilter(id) {
+    return { _id: getMovieId(id) };
+}
+
+// Validate poster image
 function parsePoster(image) {
-    if (typeof image !== 'string' || !image.startsWith('data:image/')) {
-        return { error: 'Poster image data is missing or is not an image.' };
+    if (
+        typeof image !== 'string' ||
+        !image.startsWith('data:image/')
+    ) {
+        return {
+            error: 'Poster image data is missing or is not an image.'
+        };
     }
 
     const match = /^data:(image\/(?:jpeg|png|webp|gif));base64,([A-Za-z0-9+/=\r\n]+)$/.exec(image);
 
     if (!match) {
-        return { error: 'Use a JPG, PNG, WEBP, or GIF poster.' };
+        return {
+            error: 'Use a JPG, PNG, WEBP, or GIF poster.'
+        };
     }
 
     const buffer = Buffer.from(match[2], 'base64');
@@ -306,23 +450,38 @@ function parsePoster(image) {
     }
 
     if (buffer.length > MAX_POSTER_BYTES) {
-        return { error: 'Poster is too large. Use an image under 2 MB.' };
+        return {
+            error: 'Poster is too large. Use an image under 2 MB.'
+        };
     }
 
     if (!hasImageSignature(match[1], buffer)) {
-        return { error: 'That file is not a valid image.' };
+        return {
+            error: 'That file is not a valid image.'
+        };
     }
 
-    return { ext: POSTER_TYPES[match[1]], buffer };
+    return {
+        ext: POSTER_TYPES[match[1]],
+        buffer
+    };
 }
 
+// Check actual image file signature
 function hasImageSignature(type, buffer) {
     if (type === 'image/jpeg') {
-        return buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+        return buffer[0] === 0xff &&
+            buffer[1] === 0xd8 &&
+            buffer[2] === 0xff;
     }
 
     if (type === 'image/png') {
-        return buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+        return buffer.subarray(0, 8).equals(
+            Buffer.from([
+                0x89, 0x50, 0x4e, 0x47,
+                0x0d, 0x0a, 0x1a, 0x0a
+            ])
+        );
     }
 
     if (type === 'image/gif') {
@@ -330,14 +489,33 @@ function hasImageSignature(type, buffer) {
     }
 
     if (type === 'image/webp') {
-        return buffer.length >= 12
-            && buffer.subarray(0, 4).toString('ascii') === 'RIFF'
-            && buffer.subarray(8, 12).toString('ascii') === 'WEBP';
+        return buffer.length >= 12 &&
+            buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+            buffer.subarray(8, 12).toString('ascii') === 'WEBP';
     }
 
     return false;
 }
 
+// Upload image buffer to Cloudinary
+function uploadToCloudinary(buffer, options) {
+    return new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+            options,
+            (error, result) => {
+                if (error) {
+                    return reject(error);
+                }
+
+                resolve(result);
+            }
+        );
+
+        stream.end(buffer);
+    });
+}
+
+// Save poster to Cloudinary and update MongoDB
 async function storePoster(movie, image) {
     const parsed = parsePoster(image);
 
@@ -347,51 +525,61 @@ async function storePoster(movie, image) {
         throw error;
     }
 
-    await fs.mkdir(POSTER_DIR, { recursive: true });
-
     const id = String(movie._id);
+    const publicId = `noir-cinema/posters/movie-${id}`;
 
-    await Promise.all(['jpg', 'jpeg', 'png', 'webp', 'gif'].map(ext => (
-        fs.rm(path.join(POSTER_DIR, `${id}.${ext}`), { force: true })
-    )));
-
-    const filename = `${id}.${parsed.ext}`;
-    await fs.writeFile(path.join(POSTER_DIR, filename), parsed.buffer);
-
-    const poster = `/uploads/posters/${filename}?v=${Date.now()}`;
+    const result = await uploadToCloudinary(parsed.buffer, {
+        public_id: publicId,
+        overwrite: true,
+        invalidate: true,
+        resource_type: 'image',
+        format: parsed.ext
+    });
 
     await database.collection('movies').updateOne(
         { _id: movie._id },
-        { $set: { poster } }
+        {
+            $set: {
+                poster: result.secure_url,
+                posterPublicId: result.public_id
+            }
+        }
     );
 
-    return database.collection('movies').findOne({ _id: movie._id });
+    return database.collection('movies')
+        .findOne({ _id: movie._id });
 }
 
-// Start server
+// Start local server only
 async function startServer() {
-    if (!MONGODB_URI) {
-        console.error('Missing MONGODB_URI. Check your .env file.');
-        process.exit(1);
-    }
-
     try {
-        mongoClient = new MongoClient(MONGODB_URI);
-        await mongoClient.connect();
+        if (
+            !process.env.CLOUDINARY_CLOUD_NAME ||
+            !process.env.CLOUDINARY_API_KEY ||
+            !process.env.CLOUDINARY_API_SECRET
+        ) {
+            throw new Error(
+                'Missing Cloudinary credentials. Check your .env file.'
+            );
+        }
 
-        database = mongoClient.db(DB_NAME);
-        await database.command({ ping: 1 });
-        await fs.mkdir(POSTER_DIR, { recursive: true });
+        await connectDatabase();
 
-        console.log(`Connected to MongoDB database: ${DB_NAME}`);
+        console.log('Cloudinary configuration loaded.');
 
         app.listen(PORT, () => {
-            console.log(`NOIR Cinema is running at http://localhost:${PORT}`);
-            console.log(`Database test: http://localhost:${PORT}/api/health`);
-            console.log(`Movies API: http://localhost:${PORT}/api/movies`);
+            console.log(
+                `NOIR Cinema is running at http://localhost:${PORT}`
+            );
+            console.log(
+                `Database test: http://localhost:${PORT}/api/health`
+            );
+            console.log(
+                `Movies API: http://localhost:${PORT}/api/movies`
+            );
         });
     } catch (error) {
-        console.error('Could not connect to MongoDB.');
+        console.error('Could not start NOIR Cinema.');
         console.error('Details:', error.message);
 
         if (mongoClient) {
@@ -402,7 +590,15 @@ async function startServer() {
     }
 }
 
-// Graceful shutdown
+// Export Express app for Vercel
+module.exports = app;
+
+// Only start local server when running directly
+if (require.main === module) {
+    startServer();
+}
+
+// Graceful shutdown for local development
 async function shutDown() {
     if (mongoClient) {
         await mongoClient.close().catch(() => {});
@@ -411,7 +607,7 @@ async function shutDown() {
     process.exit(0);
 }
 
-process.on('SIGINT', shutDown);
-process.on('SIGTERM', shutDown);
-
-startServer();
+if (require.main === module) {
+    process.on('SIGINT', shutDown);
+    process.on('SIGTERM', shutDown);
+}
